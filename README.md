@@ -1,4 +1,11 @@
 <p align="center">
+
+## HAL startup fix
+
+This variant of [TGLDmic 0.5.0](https://github.com/labrouss/TGLDmic) waits for the kernel driver to report readiness before publishing the microphone to Core Audio. It was verified on a Dynabook G83 after a Windows-to-macOS warm restart.
+
+Keep the matching `TGLDmic.kext` in OpenCore and install `TGLDmic-HAL-startup-fix.pkg` from [Releases](https://github.com/xiananliu/TGLDmic-HAL-Fix/releases). The repair package replaces the stock HAL plug-in installer described below.
+
   <img src="assets/tgldmic-icon-256.png" width="200" alt="TGLDmic logo">
 </p>
 

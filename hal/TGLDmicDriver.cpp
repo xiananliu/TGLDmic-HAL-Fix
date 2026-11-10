@@ -11,6 +11,7 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <atomic>
@@ -49,6 +50,7 @@ static os_log_t gLog;
 // ------------------------------------------------------------------------------------------------
 static pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
 static AudioServerPlugInHostRef gHost = nullptr;
+static std::atomic<bool> gDevicePublished { false };
 static UInt32 gRefCount = 0;
 static UInt64 gIORunning = 0;
 static std::atomic<Float32> gVolumeDB { kVolumeDefaultDB };
@@ -253,13 +255,51 @@ static ULONG Release(void *inDriver) {
     return r;
 }
 
+static bool kernelReadyForPublication() {
+    io_service_t service = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching(kTGLDmicServiceClass));
+    if (!service) return false;
+    CFTypeRef ready = IORegistryEntryCreateCFProperty(service, CFSTR("Ready"), kCFAllocatorDefault, 0);
+    IOObjectRelease(service);
+    bool result = ready == kCFBooleanTrue;
+    if (ready) CFRelease(ready);
+    return result;
+}
+
+static void publishWhenReady(AudioServerPlugInHostRef host, unsigned attemptsLeft) {
+    if (!kernelReadyForPublication()) {
+        if (attemptsLeft > 1) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                           dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                publishWhenReady(host, attemptsLeft - 1);
+            });
+        } else {
+            LOG("TGLDmic: kernel not ready for device publication");
+        }
+        return;
+    }
+
+    gDevicePublished.store(true);
+    const AudioObjectPropertyAddress changed[] = {
+        { kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kElementMain },
+        { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kElementMain },
+    };
+    OSStatus result = host->PropertiesChanged(host, kObjectID_PlugIn, 2, changed);
+    LOG("TGLDmic: announced input device after kernel became ready (status %d)", (int)result);
+}
+
 static OSStatus Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost) {
-    if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || !inHost) return kAudioHardwareBadObjectError;
     gHost = inHost;
     gLog = os_log_create(kPlugIn_BundleID, "driver");
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     gTicksPerFrame = (1e9 * (Float64)tb.denom / (Float64)tb.numer) / kSampleRate;
     LOG("TGLDmic: plug-in initialized, ticks/frame %f", gTicksPerFrame);
+    // Let HAL finish initializing, then publish once the kernel has initialized HDA.
+    // The kernel observes controller readiness for about three minutes after boot.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        publishWhenReady(inHost, 185);
+    });
     return kAudioHardwareNoError;
 }
 
@@ -371,9 +411,15 @@ static OSStatus GetPropertyDataSizeImpl(AudioServerPlugInDriverRef inDriver, Aud
     case kAudioDevicePropertyModelUID: case kAudioPlugInPropertyResourceBundle:
         *out = sizeof(CFStringRef); return 0;
     case kAudioObjectPropertyOwnedObjects:
-        *out = (obj == kObjectID_PlugIn ? 1 : (obj == kObjectID_Device && a->mScope != kAudioObjectPropertyScopeOutput) ? 2 : 0)
-               * sizeof(AudioObjectID); return 0;
-    case kAudioPlugInPropertyDeviceList: case kAudioDevicePropertyRelatedDevices:
+        if (obj == kObjectID_PlugIn) {
+            *out = gDevicePublished.load() ? sizeof(AudioObjectID) : 0;
+        } else {
+            *out = obj == kObjectID_Device && a->mScope != kAudioObjectPropertyScopeOutput ? 2 * sizeof(AudioObjectID) : 0;
+        }
+        return 0;
+    case kAudioPlugInPropertyDeviceList:
+        *out = gDevicePublished.load() ? sizeof(AudioObjectID) : 0; return 0;
+    case kAudioDevicePropertyRelatedDevices:
         *out = sizeof(AudioObjectID); return 0;
     case kAudioDevicePropertyStreams:
         *out = (a->mScope == kAudioObjectPropertyScopeOutput ? 0 : 1) * sizeof(AudioObjectID); return 0;
@@ -406,7 +452,8 @@ static OSStatus GetPropertyDataSizeImpl(AudioServerPlugInDriverRef inDriver, Aud
 static OSStatus GetPropertyDataImpl(AudioServerPlugInDriverRef inDriver, AudioObjectID obj, pid_t pid,
                                 const AudioObjectPropertyAddress *a, UInt32 qSize, const void *qData,
                                 UInt32 inDataSize, UInt32 *outDataSize, void *outData) {
-    if (inDriver != gDriverRef || !a || !outDataSize || !outData) return kAudioHardwareIllegalOperationError;
+    if (inDriver != gDriverRef || !a || !outDataSize || (!outData && inDataSize != 0))
+        return kAudioHardwareIllegalOperationError;
     if (!HasPropertyImpl(inDriver, obj, pid, a)) return kAudioHardwareUnknownPropertyError;
     auto u32 = static_cast<UInt32 *>(outData);
     auto ids = static_cast<AudioObjectID *>(outData);
@@ -419,13 +466,14 @@ static OSStatus GetPropertyDataImpl(AudioServerPlugInDriverRef inDriver, AudioOb
         case kAudioObjectPropertyOwner: NEED(sizeof(AudioObjectID)); *ids = kAudioObjectUnknown; return 0;
         case kAudioObjectPropertyManufacturer: NEED(sizeof(CFStringRef)); *str = CFSTR(kDevice_Manufacturer); return 0;
         case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList:
-            *outDataSize = inDataSize >= sizeof(AudioObjectID) ? sizeof(AudioObjectID) : 0;
+            *outDataSize = gDevicePublished.load() && inDataSize >= sizeof(AudioObjectID) ? sizeof(AudioObjectID) : 0;
             if (*outDataSize) ids[0] = kObjectID_Device;
             return 0;
         case kAudioPlugInPropertyTranslateUIDToDevice: {
             NEED(sizeof(AudioObjectID));
             CFStringRef uid = (qSize == sizeof(CFStringRef) && qData) ? *static_cast<const CFStringRef *>(qData) : nullptr;
-            *ids = (uid && CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) ? kObjectID_Device : kAudioObjectUnknown;
+            *ids = (gDevicePublished.load() && uid && CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo)
+                ? kObjectID_Device : kAudioObjectUnknown;
             return 0;
         }
         case kAudioPlugInPropertyResourceBundle: NEED(sizeof(CFStringRef)); *str = CFSTR(""); return 0;
